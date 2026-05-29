@@ -1,0 +1,157 @@
+{
+  "Comment": "Orchestrates page-by-page extraction of ClinicalTrials.gov Phase 1 data into S3. Each Lambda invocation handles exactly one page, so the 15-minute Lambda timeout is never a constraint.",
+  "StartAt": "StartRun",
+  "States": {
+    "StartRun": {
+      "Comment": "Initialise the run: generate a run_id, build the query filter (phase + optional year), and return the initial state.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "TimeoutSeconds": 150,
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-2:262967225360:function:clinicaltrials-fetcher",
+        "Payload": {
+          "action": "start",
+          "bucket.$": "$.bucket",
+          "prefix.$": "$.prefix",
+          "start_year.$": "$.start_year"
+        }
+      },
+      "ResultSelector": {
+        "state.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RunFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "FetchPage"
+    },
+
+    "FetchPage": {
+      "Comment": "Fetch one page from the API and upload it as NDJSON to S3. query_filter and start_year are forwarded so the year filter is applied consistently on every page.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "TimeoutSeconds": 150,
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-2:262967225360:function:clinicaltrials-fetcher",
+        "Payload": {
+          "action": "fetch_page",
+          "run_id.$": "$.state.run_id",
+          "bucket.$": "$.state.bucket",
+          "prefix.$": "$.state.prefix",
+          "query_filter.$": "$.state.query_filter",
+          "start_year.$": "$.state.start_year",
+          "page_token.$": "$.state.page_token",
+          "page_num.$": "$.state.page_num",
+          "total_records.$": "$.state.total_records"
+        }
+      },
+      "ResultSelector": {
+        "state.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RunFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "HasMorePages"
+    },
+
+    "HasMorePages": {
+      "Comment": "If the Lambda returned done=true, move to Finalize; otherwise loop back to FetchPage.",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.state.done",
+          "BooleanEquals": true,
+          "Next": "Finalize"
+        }
+      ],
+      "Default": "FetchPage"
+    },
+
+    "Finalize": {
+      "Comment": "List all uploaded NDJSON files for this run and write a manifest.json. Fails loudly (RuntimeError) if the run produced zero data files.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "TimeoutSeconds": 150,
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-2:262967225360:function:clinicaltrials-fetcher",
+        "Payload": {
+          "action": "finalize",
+          "run_id.$": "$.state.run_id",
+          "bucket.$": "$.state.bucket",
+          "prefix.$": "$.state.prefix",
+          "query_filter.$": "$.state.query_filter",
+          "start_year.$": "$.state.start_year",
+          "page_num.$": "$.state.page_num",
+          "total_records.$": "$.state.total_records"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RunFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+
+    "RunFailed": {
+      "Comment": "Terminal failure state — execution is marked FAILED with the error details.",
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}
