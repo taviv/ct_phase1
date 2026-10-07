@@ -1,7 +1,6 @@
 from datetime import date
 
 import duckdb
-import pandas as pd
 import pytest
 
 from ct_pipeline.transform import TABLES, transform_file
@@ -17,7 +16,9 @@ def con():
 
 
 def _read(con, out, table):
-    return con.execute(f"SELECT * FROM read_parquet('{out / f'{table}.parquet'}')").fetchdf()
+    cur = con.execute(f"SELECT * FROM read_parquet('{out / f'{table}.parquet'}')")
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
 
 def test_transform_fixture_writes_every_table(con, tmp_path):
@@ -43,17 +44,18 @@ def test_transform_derived_columns(con, tmp_path):
         )
     )
     transform_file(con, src, tmp_path / "out", "p1")
-    df = _read(con, tmp_path / "out", "studies").set_index("nct_id")
+    rows = _read(con, tmp_path / "out", "studies")
+    df = {r["nct_id"]: r for r in rows}
 
-    assert df.loc["NCT00000001", "phase_group"] == "PHASE1/PHASE2"
-    assert df.loc["NCT00000002", "phase_group"] == "NA"
-    assert df.loc["NCT00000003", "phase_group"] == "EARLY_PHASE1"
-    assert df.loc["NCT00000001", "start_date"] == pd.Timestamp(2020, 5, 1)
-    assert df.loc["NCT00000001", "start_end"] == (date(2021, 5, 1) - date(2020, 5, 1)).days
-    assert pd.isna(df.loc["NCT00000002", "start_end"])
-    assert set(_read(con, tmp_path / "out", "studies")["_src"]) == {"p1"}
+    assert df["NCT00000001"]["phase_group"] == "PHASE1/PHASE2"
+    assert df["NCT00000002"]["phase_group"] == "NA"
+    assert df["NCT00000003"]["phase_group"] == "EARLY_PHASE1"
+    assert df["NCT00000001"]["start_date"] == date(2020, 5, 1)
+    assert df["NCT00000001"]["start_end"] == (date(2021, 5, 1) - date(2020, 5, 1)).days
+    assert df["NCT00000002"]["start_end"] is None
+    assert {r["_src"] for r in rows} == {"p1"}
 
     phases = _read(con, tmp_path / "out", "study_phases")
-    assert sorted(phases[phases.nct_id == "NCT00000001"].phase) == ["PHASE1", "PHASE2"]
+    assert sorted(r["phase"] for r in phases if r["nct_id"] == "NCT00000001") == ["PHASE1", "PHASE2"]
     locs = _read(con, tmp_path / "out", "study_locations")
-    assert set(locs[locs.nct_id == "NCT00000003"].country) == {"France", "Germany"}
+    assert {r["country"] for r in locs if r["nct_id"] == "NCT00000003"} == {"France", "Germany"}
