@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Phase 1 Study Duration Dashboard</title>
+  <title>Clinical Trial Duration Dashboard</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <style>
     :root {
@@ -225,7 +225,7 @@
 
 <header>
   <div>
-    <h1>&#9203; Phase 1 Study Duration Dashboard</h1>
+    <h1>&#9203; Clinical Trial Duration Dashboard</h1>
     <p id="last-updated">Completed trials only &mdash; filtered by your selections below</p>
   </div>
   <button id="refresh-btn" onclick="applyFilters()">&#8635; Refresh</button>
@@ -238,6 +238,13 @@
 
 <!-- Filter bar -->
 <div class="filters">
+  <div class="filter-group">
+    <label>Phase</label>
+    <select id="f-phase">
+      <option value="">All phases</option>
+    </select>
+  </div>
+
   <div class="filter-group">
     <label>Completion Year</label>
     <select id="f-year">
@@ -357,19 +364,18 @@
 
 <script>
 // ---------------------------------------------------------------------------
-// Config — replace with your Lambda Function URL
+// Config — the query API is served by CloudFront on the same origin
 // ---------------------------------------------------------------------------
-const LAMBDA_URL = 'YOUR_LAMBDA_FUNCTION_URL';
+const API_URL = 'api/query';
+const OVERVIEW_URL = 'data/overview.json';
 
 // ---------------------------------------------------------------------------
 // API helper
 // ---------------------------------------------------------------------------
 async function q(name, filters = {}) {
-  const res = await fetch(LAMBDA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: name, filters }),
-  });
+  const params = new URLSearchParams({ name });
+  Object.keys(filters).sort().forEach(k => params.set(k, filters[k]));
+  const res = await fetch(`${API_URL}?${params}`);
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`HTTP ${res.status}: ${txt}`);
@@ -400,6 +406,8 @@ const PALETTE = ['#6366f1','#3b82f6','#14b8a6','#22c55e','#eab308','#f97316','#e
 // ---------------------------------------------------------------------------
 function getFilters() {
   const filters = {};
+  const phase = document.getElementById('f-phase').value;
+  if (phase) filters.phase = phase;
   const year = document.getElementById('f-year').value;
   if (year) filters.year = parseInt(year);
 
@@ -426,6 +434,7 @@ function onMulticountryChange() {
 }
 
 function clearFilters() {
+  document.getElementById('f-phase').value = '';
   document.getElementById('f-year').value = '';
   document.getElementById('f-country').value = '';
   document.getElementById('f-country').disabled = false;
@@ -673,6 +682,20 @@ async function applyFilters() {
 // ---------------------------------------------------------------------------
 async function init() {
   setStatus('Initialising…', true);
+
+  // Phase dropdown: phase groups present in the current snapshot
+  try {
+    const res = await fetch(OVERVIEW_URL, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const pSel = document.getElementById('f-phase');
+    (await res.json()).phases.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.value; opt.textContent = p.label;
+      pSel.appendChild(opt);
+    });
+  } catch (e) {
+    console.warn('Could not load phase list:', e);
+  }
 
   // Countries dropdown
   try {

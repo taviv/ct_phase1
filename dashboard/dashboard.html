@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ClinicalTrials Phase 1 Dashboard</title>
+  <title>ClinicalTrials Clinical Trials Dashboard</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <style>
     :root {
@@ -142,10 +142,16 @@
 
 <header>
   <div>
-    <h1>⚗️ ClinicalTrials.gov — Phase 1 Dashboard</h1>
+    <h1>⚗️ ClinicalTrials.gov — Clinical Trials Dashboard</h1>
     <p id="last-updated">Loading…</p>
   </div>
-  <button id="refresh-btn" onclick="loadAll()">↻ Refresh</button>
+  <div style="display:flex;gap:10px;align-items:center">
+    <select id="phase-select" onchange="loadAll()" aria-label="Phase"
+            style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">
+      <option value="ALL">All phases</option>
+    </select>
+    <button id="refresh-btn" onclick="OVERVIEW = null; loadAll()">↻ Refresh</button>
+  </div>
 </header>
 
 <nav>
@@ -202,10 +208,9 @@
 
 <script>
 // ─────────────────────────────────────────────
-// ⬇ REPLACE WITH YOUR LAMBDA FUNCTION URL
-// ─────────────────────────────────────────────
-const LAMBDA_URL = "YOUR_LAMBDA_FUNCTION_URL";
-// ─────────────────────────────────────────────
+// Overview data is precomputed by the pipeline (one block per phase group)
+// and published next to this page as data/overview.json.
+const OVERVIEW_URL = "data/overview.json";
 
 const PALETTE = [
   "#6366f1","#22c55e","#3b82f6","#eab308","#ef4444",
@@ -215,14 +220,32 @@ const PALETTE = [
 
 const charts = {};
 
-async function query(name) {
-  const res = await fetch(LAMBDA_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: name }),
+let OVERVIEW = null;
+
+async function loadOverview() {
+  if (OVERVIEW) return OVERVIEW;
+  const res = await fetch(OVERVIEW_URL, { cache: "no-cache" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} loading ${OVERVIEW_URL}`);
+  OVERVIEW = await res.json();
+  const sel = document.getElementById("phase-select");
+  const current = sel.value;
+  sel.length = 1;
+  OVERVIEW.phases.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.value;
+    opt.textContent = `${p.label} (${Number(p.studies).toLocaleString()})`;
+    sel.appendChild(opt);
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  sel.value = OVERVIEW.by_phase[current] ? current : "ALL";
+  return OVERVIEW;
+}
+
+async function query(name) {
+  const data = await loadOverview();
+  const phase = document.getElementById("phase-select").value || "ALL";
+  const block = data.by_phase[phase] || data.by_phase.ALL;
+  if (!(name in block)) throw new Error(`Query ${name} missing from ${OVERVIEW_URL}`);
+  return block[name];
 }
 
 function fmt(n) {
@@ -355,4 +378,26 @@ async function loadAll() {
       loadStatus(),
       loadByYear(),
       query("top_conditions").then(d  => hBar("conditions",   d, "#6366f1")),
-      query("top_countries").then(d   => hBar("co
+      query("top_countries").then(d   => hBar("countries",    d, "#22c55e")),
+      query("sponsor_class").then(d   => donut("sponsor",       d)),
+      query("intervention_types").then(d => donut("intervention", d)),
+      query("enrollment_distribution").then(d => hBar("enrollment", d, "#3b82f6")),
+      loadRecentTable(),
+    ]);
+    const generated = OVERVIEW && OVERVIEW.generated_at
+      ? new Date(OVERVIEW.generated_at).toLocaleString() : "unknown";
+    document.getElementById("last-updated").textContent =
+      `Data refreshed: ${generated} · loaded ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    console.error(err);
+    document.getElementById("last-updated").textContent = `Error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = "↻ Refresh";
+  }
+}
+
+document.addEventListener("DOMContentLoaded", loadAll);
+</script>
+</body>
+</html>

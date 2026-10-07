@@ -1,308 +1,170 @@
-# ClinicalTrials Phase 1 Dashboard
+# ClinicalTrials.gov Pipeline — all phases, S3 Parquet + DuckDB
 
-An end-to-end AWS pipeline that fetches Phase 1 clinical trial data from [ClinicalTrials.gov](https://clinicaltrials.gov), stores it in Aurora PostgreSQL, and exposes it through two interactive dashboards hosted on S3.
-
----
-
-## Architecture
+Weekly pipeline that pulls interventional trials of **every phase** (Early Phase 1 → Phase 4)
+from the [ClinicalTrials.gov v2 API](https://clinicaltrials.gov/data-api/api), stores them as
+Parquet on S3, and serves two dashboards. No database, no VPC, nothing running between runs.
 
 ```
-EventBridge (scheduled)
-        │
-        ▼
-  Step Functions
-        │
-        ▼
-  Lambda: clinicaltrials-fetcher        ← fetches pages from ClinicalTrials.gov API
-        │  (lambda_handler.py)
-        │  writes NDJSON files per page
-        ▼
-       S3 bucket (raw NDJSON)
-        │
-        ▼
-  Lambda: load-ct-ph1-db                ← transforms & loads into Aurora PostgreSQL
-        │  (transform_lambda.py)
-        ▼
-  Aurora PostgreSQL (9 normalised tables)
-        │
-        ▼
-  Lambda: query-ct-ph1-db               ← read-only query API via Function URL
-        │  (query_lambda.py)
-        ▼
-  S3 Static Website                     ← two HTML dashboards
-     dashboard.html                     ← overview (all statuses)
-     dashboard_duration.html            ← completed study duration, with filters
+EventBridge (weekly) ──► Step Functions
+                          │
+                          ├─ StartRun / FetchPage* / FinalizeFetch   (FetchFunction)
+                          │     only studies updated since last run, only needed fields
+                          │     → s3://data/raw/<run_id>/page_NNNN.ndjson
+                          │
+                          ├─ Map: TransformPage (×10 in parallel)    (TransformFunction, DuckDB)
+                          │     → s3://data/staging/<run_id>/<table>/page_NNNN.parquet
+                          │
+                          └─ BuildSnapshot                           (BuildFunction, DuckDB)
+                                current snapshot − changed studies + staged rows
+                                → s3://data/curated/<run_id>/<table>/data.parquet
+                                → s3://data/curated/CURRENT.json      (atomic pointer)
+                                → s3://site/data/overview.json        (overview dashboard data)
+                                → Glue tables (Athena)                 → state/watermark.json
+
+CloudFront ──► /*.html, /data/*  → S3 site bucket (private, OAC)
+           └─► /api/query?...    → QueryFunction URL (IAM auth, only CloudFront can call it)
+                                    DuckDB over the CURRENT snapshot, cached 15 min
 ```
 
----
+## Why this design
 
-## Project Structure
+| | Before (Aurora) | Now (S3 Parquet) |
+|---|---|---|
+| Always-on cost | Aurora Serverless v2 + VPC | none (S3 storage, a few Lambda minutes/week) |
+| Weekly run | refetch + reload every study | only studies with `LastUpdatePostDate` ≥ last run − 1 day |
+| API payload | full JSON | `fields=protocolSection,derivedSection,hasResults` (~50% smaller) |
+| Phase 2/3 scale | multi-row `INSERT` exceeds PostgreSQL's 65,535 parameter limit | no inserts; columnar files |
+| Overview dashboard | 11 SQL queries per page view | one static JSON per run |
+| Ad-hoc SQL | psql into the VPC | Athena (`clinical_trials` database) or DuckDB locally |
+| Deployment | ~25 manual CLI steps, hardcoded ARNs | `make deploy` (SAM) |
+| Rollback | — | keep last N snapshots; repoint `CURRENT.json` |
+
+## Repository layout
 
 ```
-ct_phase1/
-├── README.md
-├── lambdas/
-│   ├── lambda_handler.py      # Fetcher Lambda — pulls ClinicalTrials.gov API into S3
-│   ├── transform_lambda.py    # Transform Lambda — loads NDJSON from S3 into Aurora
-│   └── query_lambda.py        # Query Lambda — read-only API for dashboards
-├── step_functions/
-│   └── step_function.json     # Step Functions state machine definition
-└── dashboard/
-    ├── dashboard.html          # Overview dashboard
-    └── dashboard_duration.html # Study duration dashboard (completed trials, filterable)
+src/ct_pipeline/      one package, four Lambda handlers (handlers.py)
+  config.py           settings from env vars
+  storage.py          S3 / local-directory store (local runs and tests need no AWS)
+  fetch.py            API client: start / fetch_page / finalize
+  transform.py        DuckDB SQL: NDJSON page → one Parquet file per table
+  build.py            merge into new snapshot, overview JSON, watermark, pruning
+  queries.py          dashboard SQL shared by build and query API
+  query_api.py        Function URL handler
+  glue.py             registers the snapshot in the Glue catalog
+statemachine/         Step Functions definition (ASL)
+template.yaml         SAM template: buckets, functions, state machine, schedule, CloudFront, Athena
+dashboard/            static dashboards (Chart.js)
+scripts/              local_pipeline.py, dev_server.py
+tests/                pytest (fixtures are real API records)
 ```
 
----
+## Data model
 
-## Prerequisites
+All tables are keyed by `nct_id`. One row per study in `studies` and `study_text`.
 
-- AWS account with access to Lambda, Step Functions, S3, Aurora, EventBridge, IAM
-- Aurora Serverless v2 PostgreSQL cluster with IAM authentication enabled
-- Python 3.12 Lambda runtime
-- pg8000 packaged as a Lambda Layer (pure Python PostgreSQL driver)
+| Table | Contents |
+|---|---|
+| `studies` | status, dates, design, enrollment, lead sponsor, eligibility, FDA flags, `phases` (list), `phase_group` (e.g. `PHASE1/PHASE2`, `NA`), `start_end` (start → completion, days), `last_update_post_date` |
+| `study_text` | brief summary, detailed description, eligibility criteria (kept apart so the main table stays small) |
+| `study_phases` | one row per phase |
+| `study_conditions` | condition names |
+| `study_interventions` | type, name, description |
+| `study_outcomes` | primary / secondary / other outcome measures |
+| `study_locations` | facility, status, city, state, country, zip, latitude/longitude |
+| `study_sponsors` | lead sponsor and collaborators (`sponsor_type`, name, class) |
+| `condition_mesh_terms`, `intervention_mesh_terms` | MeSH terms and ancestors from `derivedSection` |
 
----
+## Deploy
 
-## Setup
-
-### 1. S3 Bucket (raw data)
-
-Create a bucket for raw NDJSON files:
+Prerequisites: AWS CLI credentials, [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), Python 3.12 (or Docker: `sam build --use-container`).
 
 ```bash
-aws s3 mb s3://YOUR-RAW-DATA-BUCKET --region us-east-2
+make deploy      # sam build + sam deploy --guided (first time) + upload dashboards
+make backfill    # first load: full fetch of all phased studies (~225 pages)
+make run         # incremental run now (the schedule does this weekly)
 ```
 
-### 2. Aurora PostgreSQL
+Stack parameters:
 
-Create an Aurora Serverless v2 PostgreSQL cluster. Enable IAM database authentication:
+| Parameter | Default | |
+|---|---|---|
+| `QueryTerm` | `AREA[Phase](EARLY_PHASE1 OR PHASE1 OR PHASE2 OR PHASE3 OR PHASE4)` | Essie expression selecting studies; e.g. `AREA[StudyType]INTERVENTIONAL` for all interventional studies |
+| `StartYear` | — | only studies starting in/after this year |
+| `Schedule` | `cron(0 6 ? * MON *)` | incremental run schedule |
+| `KeepSnapshots` | 3 | curated snapshots kept for rollback |
+| `RawRetentionDays` | 180 | raw NDJSON lifecycle |
+| `GlueDatabaseName` | `clinical_trials` | Athena database |
 
-```bash
-aws rds modify-db-cluster \
-  --db-cluster-identifier YOUR-CLUSTER-ID \
-  --enable-iam-database-authentication \
-  --apply-immediately --region us-east-2
-```
+After changing `QueryTerm`, run `make backfill` so the snapshot matches the new filter.
 
-Grant the IAM role to the postgres user (from psql):
+The dashboard URL is the `DashboardUrl` stack output. The query API is only reachable through
+CloudFront (the Function URL requires SigV4 signed by CloudFront's OAC), has reserved
+concurrency 10, and returns generic error messages. Put CloudFront behind an auth layer
+(e.g. Cognito / Lambda@Edge / IP allow-list) if the dashboards must not be public.
+
+### Query API
+
+`GET /api/query?name=<query>&phase=&year=&country=&multicountry=&healthy_volunteers=`
+
+Queries: `duration_summary`, `duration_histogram`, `duration_by_year`, `duration_by_sponsor`,
+`duration_by_phase`, `duration_studies`, plus every overview query (`summary_stats`,
+`status_breakdown`, `studies_by_year`, `top_conditions`, `top_countries`, `sponsor_class`,
+`top_interventions`, `enrollment_distribution`, `recent_studies`, `phase_groups`,
+`countries_completed`). Duration queries cover completed studies only. `POST` with
+`{"query": ..., "filters": {...}}` is also accepted.
+
+### Ad-hoc SQL
+
+Athena (workgroup = stack name, database `clinical_trials`):
 
 ```sql
-GRANT rds_iam TO postgres;
+SELECT phase_group, count(*) AS studies, approx_percentile(start_end, 0.5) AS median_days
+FROM studies WHERE overall_status = 'COMPLETED' GROUP BY 1 ORDER BY 1;
 ```
 
-### 3. pg8000 Lambda Layer
+DuckDB on a laptop, straight from S3:
 
-Build the layer in a Linux environment (e.g. CloudShell):
+```sql
+INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+SELECT * FROM read_parquet('s3://<data-bucket>/curated/<run_id>/studies/data.parquet') LIMIT 10;
+```
+
+### Rollback
+
+Each snapshot is immutable. To roll back, copy an older `curated/<run_id>/` reference into
+`curated/CURRENT.json` (the previous run id is recorded in it as `previous_run_id`). The
+query API picks up the change within 5 minutes; rerun a build to regenerate `overview.json`.
+
+## Local development (no AWS)
 
 ```bash
-mkdir -p python
-pip install pg8000 -t python/ --break-system-packages
-zip -r pg8000_layer.zip python/
-
-aws lambda publish-layer-version \
-  --layer-name pg8000 \
-  --zip-file fileb://pg8000_layer.zip \
-  --compatible-runtimes python3.12 \
-  --region us-east-2
+python3 -m pip install -r requirements-dev.txt
+make test                    # pytest
+make lint                    # ruff + cfn-lint
+make local MAX_PAGES=3       # fetch 3 pages from the live API → ./local/{data,site}
+make serve                   # dashboards + /api on http://localhost:8000
 ```
 
-### 4. Fetcher Lambda (`lambda_handler.py`)
+`scripts/local_pipeline.py --data s3://bucket --site s3://site-bucket` runs the same code
+against real buckets.
 
-```bash
-pip install requests -t package/
-cp lambdas/lambda_handler.py package/
-cd package && zip -r ../fetcher.zip . && cd ..
+## Configuration (Lambda environment)
 
-aws lambda create-function \
-  --function-name clinicaltrials-fetcher \
-  --runtime python3.12 \
-  --handler lambda_handler.lambda_handler \
-  --zip-file fileb://fetcher.zip \
-  --timeout 120 --memory-size 256 \
-  --role arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE \
-  --region us-east-2
-```
+| Variable | Default | |
+|---|---|---|
+| `CT_DATA_URI` | — | `s3://bucket[/prefix]` or local path |
+| `CT_SITE_URI` | — | where `data/overview.json` is written |
+| `CT_QUERY_TERM` | all phases | API `query.term` |
+| `CT_FIELDS` | `protocolSection,derivedSection,hasResults` | API `fields` |
+| `CT_PAGE_SIZE` | 1000 | API max |
+| `CT_START_YEAR` | — | |
+| `CT_GLUE_DATABASE` | — | register Glue tables when set |
+| `CT_KEEP_SNAPSHOTS` | 3 | |
+| `CT_WORK_DIR` | `/tmp/ct` | scratch space |
 
-**Environment variables:**
+## Migrating from the Aurora version
 
-| Variable | Description |
-|---|---|
-| `CT_S3_BUCKET` | Target S3 bucket name |
-| `CT_S3_PREFIX` | Key prefix (default: `clinicaltrials/phase1/`) |
-| `CT_START_YEAR` | Earliest study start year, e.g. `2022` (blank = all years) |
-| `CT_PAGE_SIZE` | Records per page, 1–1000 (default: `1000`) |
-
-### 5. Step Functions State Machine
-
-```bash
-aws stepfunctions create-state-machine \
-  --name clinicaltrials-ph1-fetcher \
-  --definition file://step_functions/step_function.json \
-  --role-arn arn:aws:iam::ACCOUNT_ID:role/YOUR-SF-ROLE \
-  --region us-east-2
-```
-
-**Execution input:**
-
-```json
-{
-  "bucket": "YOUR-RAW-DATA-BUCKET",
-  "prefix": "clinicaltrials/phase1/",
-  "start_year": "2022"
-}
-```
-
-Use `"start_year": ""` to fetch all years.
-
-### 6. Transform Lambda (`transform_lambda.py`)
-
-```bash
-cp lambdas/transform_lambda.py package/
-cd package && zip -r ../transform.zip . && cd ..
-
-aws lambda create-function \
-  --function-name load-ct-ph1-db \
-  --runtime python3.12 \
-  --handler transform_lambda.lambda_handler \
-  --zip-file fileb://transform.zip \
-  --timeout 900 --memory-size 512 \
-  --layers arn:aws:lambda:us-east-2:ACCOUNT_ID:layer:pg8000:VERSION \
-  --role arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE \
-  --region us-east-2
-```
-
-**Environment variables:**
-
-| Variable | Description |
-|---|---|
-| `CT_DB_HOST` | Aurora cluster endpoint |
-| `CT_DB_NAME` | Database name (default: `postgres`) |
-| `CT_DB_USER` | Database user (default: `postgres`) |
-| `CT_DB_PORT` | Port (default: `5432`) |
-| `CT_S3_BUCKET` | S3 bucket with NDJSON files |
-| `CT_S3_PREFIX` | Key prefix of NDJSON files |
-
-**IAM permissions required:** `s3:GetObject`, `s3:ListBucket`, `rds-db:connect`
-
-**Create tables and load data:**
-
-```json
-{"action": "create_tables"}
-{"action": "process_all"}
-```
-
-The `process_all` action tracks processed files in a `processed_files` table — re-running it safely skips already-loaded files.
-
-### 7. Query Lambda (`query_lambda.py`)
-
-```bash
-cp lambdas/query_lambda.py package/
-cd package && zip -r ../query.zip . && cd ..
-
-aws lambda create-function \
-  --function-name query-ct-ph1-db \
-  --runtime python3.12 \
-  --handler query_lambda.lambda_handler \
-  --zip-file fileb://query.zip \
-  --timeout 30 --memory-size 256 \
-  --layers arn:aws:lambda:us-east-2:ACCOUNT_ID:layer:pg8000:VERSION \
-  --role arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE \
-  --region us-east-2
-```
-
-**Same DB environment variables as the transform Lambda.**
-
-Enable a Function URL with CORS:
-
-```bash
-aws lambda create-function-url-config \
-  --function-name query-ct-ph1-db \
-  --auth-type NONE --region us-east-2
-
-aws lambda update-function-url-config \
-  --function-name query-ct-ph1-db \
-  --cors '{"AllowOrigins":["*"],"AllowMethods":["GET","POST"],"AllowHeaders":["Content-Type"],"MaxAge":300}' \
-  --region us-east-2
-```
-
-Copy the Function URL and paste it into both dashboard HTML files as `LAMBDA_URL`.
-
-### 8. Dashboard (S3 Static Site)
-
-```bash
-# Create bucket
-aws s3 mb s3://YOUR-DASHBOARD-BUCKET --region us-east-2
-
-# Disable block public access
-aws s3api put-public-access-block \
-  --bucket YOUR-DASHBOARD-BUCKET \
-  --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
-
-# Apply bucket policy
-aws s3api put-bucket-policy --bucket YOUR-DASHBOARD-BUCKET --policy '{
-  "Version":"2012-10-17",
-  "Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::YOUR-DASHBOARD-BUCKET/*"}]
-}'
-
-# Enable static website hosting
-aws s3 website s3://YOUR-DASHBOARD-BUCKET \
-  --index-document dashboard.html
-
-# Upload dashboards
-aws s3 cp dashboard/dashboard.html s3://YOUR-DASHBOARD-BUCKET/dashboard.html --content-type text/html
-aws s3 cp dashboard/dashboard_duration.html s3://YOUR-DASHBOARD-BUCKET/dashboard_duration.html --content-type text/html
-```
-
-Access at:
-`http://YOUR-DASHBOARD-BUCKET.s3-website.us-east-2.amazonaws.com/dashboard.html`
-
----
-
-## Database Schema
-
-| Table | Description |
-|---|---|
-| `studies` | Core study fields (status, dates, sponsor, enrollment) |
-| `study_conditions` | Medical conditions per study |
-| `study_interventions` | Drug / device interventions per study |
-| `study_locations` | Site countries and facilities |
-| `study_contacts` | Primary contacts |
-| `study_outcomes` | Primary and secondary outcomes |
-| `study_eligibility` | Eligibility criteria |
-| `study_references` | Publications and citations |
-| `processed_files` | File tracking table (prevents duplicate loads) |
-
-The `start_end` column on `studies` stores the duration in days (`completion_date - start_date`) and powers the duration dashboard.
-
----
-
-## Dashboards
-
-### Overview Dashboard (`dashboard.html`)
-All Phase 1 studies across all statuses. Charts: study status breakdown, studies started by year, top conditions, top countries, sponsor class, intervention types, enrollment distribution.
-
-### Duration Dashboard (`dashboard_duration.html`)
-Completed studies only. Filters: completion year, country, multi-country toggle, healthy volunteers toggle. Charts: duration histogram, average duration trend by year, average duration by sponsor class. Detail table of top 100 longest studies.
-
----
-
-## Scheduled Refresh
-
-Trigger the full pipeline on a schedule via EventBridge:
-
-```bash
-aws events put-rule \
-  --name ct-ph1-weekly \
-  --schedule-expression "cron(0 6 ? * MON *)" \
-  --state ENABLED \
-  --region us-east-2
-```
-
----
-
-## Notes
-
-- The fetcher Lambda uses the [ClinicalTrials.gov v2 API](https://clinicaltrials.gov/api/v2/studies) with the Essie query `AREA[Phase]Phase1`.
-- All Lambda-to-Aurora connections use IAM authentication (no stored passwords).
-- pg8000 is used instead of psycopg2 to avoid C-extension platform compilation issues on Lambda.
-- The transform Lambda is idempotent: re-running `process_all` only processes new files.
+1. `make deploy && make backfill`.
+2. Check the new dashboards, then delete the old Aurora cluster, its VPC endpoints/security
+   groups, the old Lambdas, the pg8000 layer, the old state machine and its schedule.
+   The old raw NDJSON in S3 can be deleted or kept; the new pipeline does not read it.
